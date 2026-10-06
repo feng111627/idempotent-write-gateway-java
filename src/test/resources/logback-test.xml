@@ -1,0 +1,15 @@
+<configuration>
+    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+        <encoder>
+            <pattern>%d{HH:mm:ss.SSS} %-5level [%thread] %logger{28} - %msg%n</pattern>
+        </encoder>
+    </appender>
+
+    <!-- 幂等与业务日志在测试时可见，便于观察用例覆盖了哪些分支 -->
+    <logger name="com.github.feng111627.idempotentwritegatewayjava.idempotency" level="DEBUG"/>
+    <logger name="com.github.feng111627.idempotentwritegatewayjava.order" level="DEBUG"/>
+
+    <root level="INFO">
+        <appender-ref ref="STDOUT"/>
+    </root>
+</configuration>

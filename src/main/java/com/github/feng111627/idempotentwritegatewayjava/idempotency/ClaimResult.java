@@ -24,8 +24,12 @@ public sealed interface ClaimResult {
     record Replaying(IdempotencyRecord record) implements ClaimResult {
     }
 
-    /** 同键请求仍在处理中。 */
-    record Processing() implements ClaimResult {
+    /**
+     * 同键请求仍在处理中。
+     *
+     * @param retryAfterSeconds 建议客户端多久后再来查询/重试（秒，恒 ≥ 1）
+     */
+    record Processing(int retryAfterSeconds) implements ClaimResult {
     }
 
     /** 因明确原因被拒绝。 */

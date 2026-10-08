@@ -15,7 +15,10 @@ import org.springframework.context.annotation.Configuration;
 public class IdempotencyConfig {
 
     @Bean
-    public IdempotencyStore idempotencyStore() {
-        return new InMemoryIdempotencyStore();
+    public IdempotencyStore idempotencyStore(IdempotencyProperties properties) {
+        return new InMemoryIdempotencyStore(
+                properties.getRetentionWindows(),
+                properties.getMaxRecords(),
+                properties.getProcessingRetryAfter());
     }
 }

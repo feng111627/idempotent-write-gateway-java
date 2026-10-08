@@ -43,16 +43,39 @@ public final class IdempotencyRecord {
                 0, null, null, now, safeAdd(now, ttlMillis));
     }
 
-    /** 流转为 SUCCEEDED，并固化首次执行的响应；过期时间不变。 */
+    /** 流转为 SUCCEEDED，并固化首次执行的响应；过期时间不变（老配置的固定截止语义）。 */
     public IdempotencyRecord toSucceeded(int httpStatus, String contentType, String body) {
         return new IdempotencyRecord(key, IdempotencyStatus.SUCCEEDED, requestHash,
                 httpStatus, contentType, body, createdAtMillis, expiresAtMillis);
     }
 
-    /** 流转为 FAILED，清空响应；过期时间不变（TTL 内允许同内容重试）。 */
+    /**
+     * 流转为 SUCCEEDED，并固化首次执行的响应；
+     * 分状态保留策略下，成功窗口从固化成功时刻（now）重新起算。
+     */
+    public IdempotencyRecord toSucceeded(int httpStatus, String contentType, String body,
+                                         long now, long succeededTtlMillis) {
+        return new IdempotencyRecord(key, IdempotencyStatus.SUCCEEDED, requestHash,
+                httpStatus, contentType, body, now, safeAdd(now, succeededTtlMillis));
+    }
+
+    /** 流转为 FAILED，清空响应；过期时间不变（老配置的固定截止语义）。 */
     public IdempotencyRecord toFailed() {
         return new IdempotencyRecord(key, IdempotencyStatus.FAILED, requestHash,
                 0, null, null, createdAtMillis, expiresAtMillis);
+    }
+
+    /**
+     * 流转为 FAILED，清空响应；分状态保留策略下，失败重试窗口从标记失败时刻（now）重新起算。
+     */
+    public IdempotencyRecord toFailed(long now, long failedTtlMillis) {
+        return new IdempotencyRecord(key, IdempotencyStatus.FAILED, requestHash,
+                0, null, null, now, safeAdd(now, failedTtlMillis));
+    }
+
+    /** 记录的剩余存活毫秒数（不为负）。 */
+    public long remainingMillis(long now) {
+        return Math.max(0L, expiresAtMillis - now);
     }
 
     /** 记录是否已过期（过期后同键可被重新抢占）。 */

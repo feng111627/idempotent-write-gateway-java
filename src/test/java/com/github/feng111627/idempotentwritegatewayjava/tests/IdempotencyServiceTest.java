@@ -1,8 +1,10 @@
 package com.github.feng111627.idempotentwritegatewayjava.tests;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
@@ -14,9 +16,10 @@ import com.github.feng111627.idempotentwritegatewayjava.idempotency.IdempotencyP
 import com.github.feng111627.idempotentwritegatewayjava.idempotency.IdempotencyRejectedException;
 import com.github.feng111627.idempotentwritegatewayjava.idempotency.IdempotencyService;
 import com.github.feng111627.idempotentwritegatewayjava.idempotency.RejectionReason;
+import com.github.feng111627.idempotentwritegatewayjava.idempotency.RetentionWindows;
 
 /**
- * 幂等服务单元测试：幂等键缺失/格式判定与请求指纹稳定性、区分度。
+ * 幂等服务单元测试：幂等键缺失/格式判定、请求指纹、保留窗口配置解析与非法配置拒绝。
  */
 class IdempotencyServiceTest {
 
@@ -80,12 +83,85 @@ class IdempotencyServiceTest {
     }
 
     @Test
-    @DisplayName("【配置】TTL 默认为 24 小时，可被覆盖")
-    void defaultTtlIs24Hours() {
-        log.info("====== 用例: defaultTtlIs24Hours ======");
-        assertEquals(Duration.ofHours(24), properties.getTtl());
-        properties.setTtl(Duration.ofSeconds(1));
-        assertEquals(Duration.ofSeconds(1), properties.getTtl());
-        log.info("用例通过: 默认 TTL=24h，且支持配置覆盖");
+    @DisplayName("【配置】默认三段保留窗口：处理 2m < 失败 30m < 成功 24h，状态切换重算")
+    void defaultPerStateWindows() {
+        log.info("====== 用例: defaultPerStateWindows ======");
+        RetentionWindows windows = properties.getRetentionWindows();
+        assertEquals(Duration.ofMinutes(2), windows.processingTtl());
+        assertEquals(Duration.ofMinutes(30), windows.failedTtl());
+        assertEquals(Duration.ofHours(24), windows.succeededTtl());
+        assertTrue(windows.rebaseOnTransition(), "分状态默认配置应在状态切换时重算窗口");
+        assertTrue(windows.processingTtl().compareTo(windows.failedTtl()) < 0);
+        assertTrue(windows.failedTtl().compareTo(windows.succeededTtl()) < 0);
+        log.info("用例通过: 默认窗口 处理=2m、失败=30m、成功=24h，且依次递增");
+    }
+
+    @Test
+    @DisplayName("【配置-兼容】只配老的 idempotency.ttl：三段窗口取同值，且沿用固定截止（不重算）旧语义")
+    void legacySingleTtlKeepsOldSemantics() {
+        log.info("====== 用例: legacySingleTtlKeepsOldSemantics ======");
+        IdempotencyProperties legacy = new IdempotencyProperties();
+        legacy.setTtl(Duration.ofHours(24));
+
+        RetentionWindows windows = legacy.getRetentionWindows();
+        assertEquals(Duration.ofHours(24), windows.processingTtl());
+        assertEquals(Duration.ofHours(24), windows.succeededTtl());
+        assertEquals(Duration.ofHours(24), windows.failedTtl());
+        assertFalse(windows.rebaseOnTransition(),
+                "只配老 ttl 时必须保持旧语义：从抢占时刻起算的固定截止时间");
+        log.info("用例通过: 老配置 idempotency.ttl=24h → 三段窗口均为 24h 且不重算，升级后含义不变");
+    }
+
+    @Test
+    @DisplayName("【配置-兼容】老 ttl 与分段时长可混用：缺省的分段回退取 ttl，出现分段配置则切换为重算模式")
+    void legacyTtlWithPartialOverride() {
+        log.info("====== 用例: legacyTtlWithPartialOverride ======");
+        IdempotencyProperties mixed = new IdempotencyProperties();
+        mixed.setTtl(Duration.ofHours(24));
+        mixed.setProcessingTtl(Duration.ofMinutes(1));
+
+        RetentionWindows windows = mixed.getRetentionWindows();
+        assertEquals(Duration.ofMinutes(1), windows.processingTtl());
+        assertEquals(Duration.ofHours(24), windows.succeededTtl());
+        assertEquals(Duration.ofHours(24), windows.failedTtl());
+        assertTrue(windows.rebaseOnTransition());
+        log.info("用例通过: 老 ttl 与分段配置混用时，未覆盖的分段回退为 ttl，且切换为重算模式");
+    }
+
+    @Test
+    @DisplayName("【配置-非法】零/负时长必须拒绝，并指明具体配置项")
+    void invalidTtlRejectedAtStartup() {
+        log.info("====== 用例: invalidTtlRejectedAtStartup ======");
+        assertInvalidWithProperty(Duration.ZERO, "idempotency.processing-ttl", p -> p.setProcessingTtl(Duration.ZERO));
+        assertInvalidWithProperty(Duration.ofMinutes(-5), "idempotency.failed-ttl", p -> p.setFailedTtl(Duration.ofMinutes(-5)));
+        assertInvalidWithProperty(Duration.ZERO, "idempotency.ttl", p -> p.setTtl(Duration.ZERO));
+        log.info("用例通过: 零/负时长一律拒绝，异常信息指明配置项与非法值");
+    }
+
+    @Test
+    @DisplayName("【配置-非法】容量/键长为非正整数必须拒绝")
+    void invalidBoundsRejectedAtStartup() {
+        log.info("====== 用例: invalidBoundsRejectedAtStartup ======");
+        IdempotencyProperties badCapacity = new IdempotencyProperties();
+        badCapacity.setMaxRecords(0);
+        IllegalStateException ex = assertThrows(IllegalStateException.class,
+                badCapacity::getRetentionWindows);
+        assertTrue(ex.getMessage().contains("idempotency.max-records"), ex.getMessage());
+
+        IdempotencyProperties badLength = new IdempotencyProperties();
+        badLength.setMaxKeyLength(-1);
+        assertTrue(assertThrows(IllegalStateException.class, badLength::getRetentionWindows)
+                .getMessage().contains("idempotency.max-key-length"));
+        log.info("用例通过: max-records=0 / max-key-length=-1 均启动失败并指明配置项");
+    }
+
+    private void assertInvalidWithProperty(Duration value, String expectedProperty,
+                                           java.util.function.Consumer<IdempotencyProperties> setter) {
+        IdempotencyProperties props = new IdempotencyProperties();
+        setter.accept(props);
+        IllegalStateException ex = assertThrows(IllegalStateException.class,
+                props::getRetentionWindows, "非法时长 " + value + " 必须导致启动失败");
+        assertTrue(ex.getMessage().contains(expectedProperty),
+                "异常信息应包含配置项名 " + expectedProperty + "，实际: " + ex.getMessage());
     }
 }

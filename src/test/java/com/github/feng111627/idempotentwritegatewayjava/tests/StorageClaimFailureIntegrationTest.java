@@ -36,7 +36,8 @@ class StorageClaimFailureIntegrationTest {
     static class AlwaysFailingClaimStore extends InMemoryIdempotencyStore {
         @Override
         public com.github.feng111627.idempotentwritegatewayjava.idempotency.ClaimResult claim(
-                String key, String requestHash, java.time.Duration ttl) {
+                String key, String requestHash,
+                com.github.feng111627.idempotentwritegatewayjava.idempotency.RetentionWindows windows) {
             throw new IdempotencyStorageException("【模拟】Redis 连接被拒绝");
         }
     }

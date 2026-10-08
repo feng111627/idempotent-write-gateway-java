@@ -26,15 +26,21 @@ import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.header;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
+import com.github.feng111627.idempotentwritegatewayjava.idempotency.IdempotencyProperties;
+import com.github.feng111627.idempotentwritegatewayjava.idempotency.IdempotencyStatus;
 import com.github.feng111627.idempotentwritegatewayjava.idempotency.InMemoryIdempotencyStore;
 import com.github.feng111627.idempotentwritegatewayjava.order.OrderService;
 
 /**
  * 端到端集成测试：经过真实的 Filter → Controller → Service 链路，
- * 覆盖需求要求的四类场景：重复提交、并发抢占、过期重放、存储异常。
+ * 覆盖：重复提交、并发抢占、过期重放、存储异常、in-flight 护栏、分状态窗口与状态查询。
+ *
+ * <p>沿用老配置 {@code idempotency.ttl=1s}：三段窗口均为 1s 且保持“抢占时刻固定截止”语义，
+ * 用于验证升级后老配置行为不变。
  */
 @SpringBootTest(properties = "idempotency.ttl=1s")
 @AutoConfigureMockMvc
@@ -47,6 +53,11 @@ class IdempotencyWebIntegrationTest {
         private final AtomicLong clock = new AtomicLong(System.currentTimeMillis());
         private volatile boolean failOnComplete;
 
+        TestStore(IdempotencyProperties properties) {
+            super(properties.getRetentionWindows(), properties.getMaxRecords(),
+                    properties.getProcessingRetryAfter());
+        }
+
         @Override
         protected long nowMillis() {
             return clock.get();
@@ -54,6 +65,10 @@ class IdempotencyWebIntegrationTest {
 
         void advance(Duration d) {
             clock.addAndGet(d.toMillis());
+        }
+
+        long currentClockMillis() {
+            return clock.get();
         }
 
         @Override
@@ -74,8 +89,8 @@ class IdempotencyWebIntegrationTest {
     static class TestStoreConfig {
         @Bean
         @Primary
-        TestStore testStore() {
-            return new TestStore();
+        TestStore testStore(IdempotencyProperties properties) {
+            return new TestStore(properties);
         }
     }
 
@@ -204,7 +219,6 @@ class IdempotencyWebIntegrationTest {
         int processing = statusCount.getOrDefault(409, 0);
         assertEquals(concurrency, ok + processing, "每个请求必须是 200（首次或重放）或 409（处理中）");
         assertTrue(ok >= 1, "至少应有一个请求成功");
-        // 成功的请求里，除首次外都必须是重放；业务总执行次数恰好 1
         assertEquals(1, orderService.getInvocationCount(),
                 "并发下业务副作用必须只产生一次");
         log.info("场景通过: {} 个并发请求中 200={}（含重放），409处理中={}，业务真实执行=1",
@@ -212,9 +226,9 @@ class IdempotencyWebIntegrationTest {
     }
 
     @Test
-    @DisplayName("【过期重放】记录超过 TTL 后，同一个键可以重新处理并再次执行业务")
+    @DisplayName("【过期重放】记录超过统一 TTL 后，同一个键可以重新处理并再次执行业务（老配置语义不变）")
     void expiredKeyCanBeReprocessed() throws Exception {
-        log.info("====== 场景: 过期重放 ======");
+        log.info("====== 场景: 过期重放（老配置 idempotency.ttl=1s 固定截止）======");
         mockMvc.perform(post("/api/orders")
                         .header("Idempotency-Key", "ttl-key-1")
                         .contentType("application/json").content(ORDER_BODY))
@@ -242,7 +256,7 @@ class IdempotencyWebIntegrationTest {
     }
 
     @Test
-    @DisplayName("【业务失败可重试】业务返回非 2xx 时记录 FAILED，相同内容可用同键重试成功")
+    @DisplayName("【业务失败可重试】业务返回非 2xx 时记录 FAILED，相同内容可用同键重试；过期后恢复新提交")
     void businessFailureIsRetryableWithSameKey() throws Exception {
         log.info("====== 场景: 业务失败后的重试规则 ======");
         String badBody = "{\"productId\":\"prod-1\",\"quantity\":0}";
@@ -253,8 +267,7 @@ class IdempotencyWebIntegrationTest {
                         .header("Idempotency-Key", "retry-key-1")
                         .contentType("application/json").content(badBody))
                 .andExpect(status().isBadRequest());
-        assertEquals(com.github.feng111627.idempotentwritegatewayjava.idempotency
-                .IdempotencyStatus.FAILED, store.peek("retry-key-1").getStatus());
+        assertEquals(IdempotencyStatus.FAILED, store.peek("retry-key-1").getStatus());
 
         // FAILED + 不同内容：仍然拒绝
         mockMvc.perform(post("/api/orders")
@@ -264,18 +277,22 @@ class IdempotencyWebIntegrationTest {
                 .andExpect(result -> assertTrue(result.getResponse().getContentAsString()
                         .contains("IDEMPOTENCY_REQUEST_MISMATCH")));
 
-        // FAILED + 相同内容：允许重试，但内容本身仍非法所以还是 400 且保持 FAILED
+        // FAILED + 相同内容：允许重试，真实再进一次业务，但内容本身仍非法所以还是 400 且保持 FAILED
         mockMvc.perform(post("/api/orders")
                         .header("Idempotency-Key", "retry-key-1")
                         .contentType("application/json").content(badBody))
                 .andExpect(status().isBadRequest());
+        assertEquals(2, orderService.getInvocationCount(), "同内容失败重试会真实再执行一次业务（仍失败）");
 
-        // 用一个新键演示“同内容修正后重试成功”：首次合法直接成功
+        // 失败窗口过期后，同键可重新提交（含换新内容）
+        store.advance(Duration.ofSeconds(2));
         mockMvc.perform(post("/api/orders")
-                        .header("Idempotency-Key", "retry-key-2")
+                        .header("Idempotency-Key", "retry-key-1")
                         .contentType("application/json").content(goodBody))
                 .andExpect(status().isOk());
-        log.info("场景通过: 业务失败 → FAILED；TTL 内只允许同内容重试；内容冲突仍拒绝");
+        assertEquals(3, orderService.getInvocationCount(),
+                "窗口过期后同键应当作新提交执行（首次失败 + 一次同内容重试 + 过期后新提交）");
+        log.info("场景通过: 业务失败 → FAILED；窗口内只允许同内容重试；过期后同键恢复为新提交");
     }
 
     @Test
@@ -293,7 +310,7 @@ class IdempotencyWebIntegrationTest {
                 "业务已成功，真实结果必须照常返回给客户端");
         int executionsAfterFirst = orderService.getInvocationCount();
 
-        // 固化失败后记录停留在 PROCESSING：TTL 内重试得到 409 PROCESSING，杜绝重复副作用
+        // 固化失败后记录停留在 PROCESSING：窗口内重试得到 409 PROCESSING，杜绝重复副作用
         mockMvc.perform(post("/api/orders")
                         .header("Idempotency-Key", "complete-fail-key")
                         .contentType("application/json").content(ORDER_BODY))
@@ -301,12 +318,92 @@ class IdempotencyWebIntegrationTest {
         assertEquals(executionsAfterFirst, orderService.getInvocationCount(),
                 "兜底期间重试不得再次执行业务");
 
-        // TTL 过期后键重新可用
+        // 处理窗口过期后键重新可用
         store.advance(Duration.ofSeconds(2));
         mockMvc.perform(post("/api/orders")
                         .header("Idempotency-Key", "complete-fail-key")
                         .contentType("application/json").content(ORDER_BODY))
                 .andExpect(status().isOk());
-        log.info("场景通过: 固化失败不向客户端报错、不返回假结果；TTL 内重试 409；过期后恢复");
+        log.info("场景通过: 固化失败不向客户端报错、不返回假结果；窗口内重试 409；过期后恢复");
+    }
+
+    @Test
+    @DisplayName("【状态查询】不存在/处理中(带Retry-After)/成功/失败可重试/已过期 五个分支都可区分")
+    void statusEndpointBranches() throws Exception {
+        log.info("====== 场景: 状态查询各分支 ======");
+        // 从未提交
+        mockMvc.perform(get("/api/idempotency/status").header("Idempotency-Key", "st-never"))
+                .andExpect(status().isOk())
+                .andExpect(r -> assertTrue(r.getResponse().getContentAsString().contains("\"state\":\"NOT_FOUND\""),
+                        r.getResponse().getContentAsString()));
+
+        // 成功
+        mockMvc.perform(post("/api/orders")
+                        .header("Idempotency-Key", "st-ok").contentType("application/json").content(ORDER_BODY))
+                .andExpect(status().isOk());
+        mockMvc.perform(get("/api/idempotency/status").header("Idempotency-Key", "st-ok"))
+                .andExpect(status().isOk())
+                .andExpect(r -> assertTrue(r.getResponse().getContentAsString().contains("\"state\":\"SUCCEEDED\"")));
+
+        // 失败可重试
+        mockMvc.perform(post("/api/orders")
+                        .header("Idempotency-Key", "st-fail")
+                        .contentType("application/json")
+                        .content("{\"productId\":\"p\",\"quantity\":0}"))
+                .andExpect(status().isBadRequest());
+        mockMvc.perform(get("/api/idempotency/status").header("Idempotency-Key", "st-fail"))
+                .andExpect(status().isOk())
+                .andExpect(r -> assertTrue(
+                        r.getResponse().getContentAsString().contains("\"state\":\"FAILED_RETRYABLE\"")));
+
+        // 已过期 = NOT_FOUND
+        store.advance(Duration.ofSeconds(2));
+        mockMvc.perform(get("/api/idempotency/status").header("Idempotency-Key", "st-ok"))
+                .andExpect(status().isOk())
+                .andExpect(r -> assertTrue(r.getResponse().getContentAsString().contains("\"state\":\"NOT_FOUND\"")));
+
+        // 键缺失/非法仍然 400
+        mockMvc.perform(get("/api/idempotency/status"))
+                .andExpect(status().isBadRequest());
+        mockMvc.perform(get("/api/idempotency/status").header("Idempotency-Key", "bad key"))
+                .andExpect(status().isBadRequest());
+        log.info("场景通过: 状态查询区分 NOT_FOUND/PROCESSING/SUCCEEDED/FAILED_RETRYABLE/过期，键校验一致");
+    }
+
+    @Test
+    @DisplayName("【处理中提示】处理中提交与状态查询都给出按剩余窗口计算的 Retry-After / retryAfterSeconds")
+    void processingReturnsDynamicRetryAfter() throws Exception {
+        log.info("====== 场景: 处理中的可观测重试提示 ======");
+        // 直接注入一条剩余 10s 的 PROCESSING 记录（且不在 in-flight 集合中），模拟“首请在别处占着键”
+        String key = "st-processing";
+        store.putForTesting(key, com.github.feng111627.idempotentwritegatewayjava.idempotency
+                .IdempotencyRecord.processing(key, hashOf(ORDER_BODY),
+                        store.currentClockMillis(), Duration.ofSeconds(10).toMillis()));
+
+        mockMvc.perform(post("/api/orders")
+                        .header("Idempotency-Key", key)
+                        .contentType("application/json").content(ORDER_BODY))
+                .andExpect(status().isConflict())
+                .andExpect(header().string("Retry-After", "10"))
+                .andExpect(r -> assertTrue(r.getResponse().getContentAsString().contains("\"retryAfterSeconds\":10")));
+
+        mockMvc.perform(get("/api/idempotency/status").header("Idempotency-Key", key))
+                .andExpect(status().isOk())
+                .andExpect(r -> {
+                    String body = r.getResponse().getContentAsString();
+                    assertTrue(body.contains("\"state\":\"PROCESSING\""), body);
+                    assertTrue(body.contains("\"retryAfterSeconds\":10"), body);
+                });
+        log.info("场景通过: 409 与状态查询都返回动态 Retry-After=10（剩余处理窗口秒数，向上取整）");
+    }
+
+    private static String hashOf(String body) {
+        try {
+            java.security.MessageDigest digest = java.security.MessageDigest.getInstance("SHA-256");
+            return java.util.HexFormat.of().formatHex(digest.digest(body.getBytes(
+                    java.nio.charset.StandardCharsets.UTF_8)));
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IllegalStateException(e);
+        }
     }
 }

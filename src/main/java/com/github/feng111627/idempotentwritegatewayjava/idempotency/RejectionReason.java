@@ -15,5 +15,8 @@ public enum RejectionReason {
     REQUEST_MISMATCH,
 
     /** 幂等记录底层存储不可用或写入失败，按 fail-closed 策略拒绝。 */
-    STORAGE_UNAVAILABLE
+    STORAGE_UNAVAILABLE,
+
+    /** 内存容量已达上限且无法淘汰出可用槽位，按 fail-closed 策略拒绝。 */
+    CAPACITY_FULL
 }

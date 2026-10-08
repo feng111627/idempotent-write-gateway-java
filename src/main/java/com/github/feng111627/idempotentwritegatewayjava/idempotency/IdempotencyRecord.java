@@ -43,16 +43,44 @@ public final class IdempotencyRecord {
                 0, null, null, now, safeAdd(now, ttlMillis));
     }
 
-    /** 流转为 SUCCEEDED，并固化首次执行的响应；过期时间不变。 */
+    /** 创建一条 SUCCEEDED 记录（用于跨处理中窗口后重新固化结果）。 */
+    public static IdempotencyRecord succeeded(String key, String requestHash, int httpStatus,
+                                              String contentType, String body,
+                                              long createdAtMillis, long expiresAtMillis) {
+        return new IdempotencyRecord(key, IdempotencyStatus.SUCCEEDED, requestHash,
+                httpStatus, contentType, body, createdAtMillis, expiresAtMillis);
+    }
+
+    /** 创建一条 FAILED 记录（用于跨处理中窗口后重新标记失败）。 */
+    public static IdempotencyRecord failed(String key, String requestHash,
+                                           long createdAtMillis, long expiresAtMillis) {
+        return new IdempotencyRecord(key, IdempotencyStatus.FAILED, requestHash,
+                0, null, null, createdAtMillis, expiresAtMillis);
+    }
+
+    /** 流转为 SUCCEEDED，并固化首次执行的响应；过期时间不变（老的统一 TTL 语义）。 */
     public IdempotencyRecord toSucceeded(int httpStatus, String contentType, String body) {
         return new IdempotencyRecord(key, IdempotencyStatus.SUCCEEDED, requestHash,
                 httpStatus, contentType, body, createdAtMillis, expiresAtMillis);
     }
 
-    /** 流转为 FAILED，清空响应；过期时间不变（TTL 内允许同内容重试）。 */
+    /** 流转为 SUCCEEDED，同时按成功保留窗口重新锚定创建/过期时刻（分状态 TTL 语义）。 */
+    public IdempotencyRecord toSucceeded(int httpStatus, String contentType, String body,
+                                         long newExpiresAtMillis, long newCreatedAtMillis) {
+        return new IdempotencyRecord(key, IdempotencyStatus.SUCCEEDED, requestHash,
+                httpStatus, contentType, body, newCreatedAtMillis, newExpiresAtMillis);
+    }
+
+    /** 流转为 FAILED，清空响应；过期时间不变（老的统一 TTL 语义）。 */
     public IdempotencyRecord toFailed() {
         return new IdempotencyRecord(key, IdempotencyStatus.FAILED, requestHash,
                 0, null, null, createdAtMillis, expiresAtMillis);
+    }
+
+    /** 流转为 FAILED，同时按失败保留窗口重新锚定创建/过期时刻（分状态 TTL 语义）。 */
+    public IdempotencyRecord toFailed(long newExpiresAtMillis, long newCreatedAtMillis) {
+        return new IdempotencyRecord(key, IdempotencyStatus.FAILED, requestHash,
+                0, null, null, newCreatedAtMillis, newExpiresAtMillis);
     }
 
     /** 记录是否已过期（过期后同键可被重新抢占）。 */

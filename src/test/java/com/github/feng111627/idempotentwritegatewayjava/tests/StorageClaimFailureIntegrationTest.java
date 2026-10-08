@@ -15,6 +15,7 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Primary;
 import org.springframework.test.web.servlet.MockMvc;
+import com.github.feng111627.idempotentwritegatewayjava.idempotency.IdempotencyConfig;
 import com.github.feng111627.idempotentwritegatewayjava.idempotency.IdempotencyStorageException;
 import com.github.feng111627.idempotentwritegatewayjava.idempotency.IdempotencyStore;
 import com.github.feng111627.idempotentwritegatewayjava.idempotency.InMemoryIdempotencyStore;
@@ -34,9 +35,14 @@ class StorageClaimFailureIntegrationTest {
 
     /** claim 永远抛存储异常的存储。 */
     static class AlwaysFailingClaimStore extends InMemoryIdempotencyStore {
+        AlwaysFailingClaimStore() {
+            super(IdempotencyConfig.defaultPolicy());
+        }
+
         @Override
         public com.github.feng111627.idempotentwritegatewayjava.idempotency.ClaimResult claim(
-                String key, String requestHash, java.time.Duration ttl) {
+                String key, String requestHash,
+                com.github.feng111627.idempotentwritegatewayjava.idempotency.RetentionPolicy policy) {
             throw new IdempotencyStorageException("【模拟】Redis 连接被拒绝");
         }
     }

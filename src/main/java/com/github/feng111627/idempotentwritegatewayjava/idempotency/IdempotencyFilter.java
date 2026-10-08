@@ -42,18 +42,18 @@ public class IdempotencyFilter extends OncePerRequestFilter {
 
     private final IdempotencyService idempotencyService;
     private final IdempotencyStore store;
-    private final IdempotencyProperties properties;
+    private final RetentionPolicy retentionPolicy;
     private final RequestMappingInfoHandlerMapping handlerMapping;
     private final ObjectMapper objectMapper;
 
     public IdempotencyFilter(IdempotencyService idempotencyService,
                              IdempotencyStore store,
-                             IdempotencyProperties properties,
+                             RetentionPolicy retentionPolicy,
                              RequestMappingInfoHandlerMapping handlerMapping,
                              ObjectMapper objectMapper) {
         this.idempotencyService = idempotencyService;
         this.store = store;
-        this.properties = properties;
+        this.retentionPolicy = retentionPolicy;
         this.handlerMapping = handlerMapping;
         this.objectMapper = objectMapper;
     }
@@ -85,7 +85,7 @@ public class IdempotencyFilter extends OncePerRequestFilter {
 
         ClaimResult claim;
         try {
-            claim = store.claim(key, requestHash, properties.getTtl());
+            claim = store.claim(key, requestHash, retentionPolicy);
         } catch (IdempotencyStorageException e) {
             // fail-closed：存储不可用时直接拒绝，绝不执行业务，避免“无记录兜底”的重复执行
             log.error("[幂等] key={} 抢占阶段存储不可用，fail-closed 拒绝请求: {}",
@@ -100,9 +100,10 @@ public class IdempotencyFilter extends OncePerRequestFilter {
                 log.info("[幂等] key={} 重放首次成功结果，业务不会再次执行", key);
                 replay(response, replaying.record());
             }
-            case ClaimResult.Processing ignored -> {
-                log.info("[幂等] key={} 首次请求仍在处理中，返回 409 PROCESSING", key);
-                writeProcessing(response);
+            case ClaimResult.Processing processing -> {
+                log.info("[幂等] key={} 首次请求仍在处理中，返回 409 PROCESSING，Retry-After={}s",
+                        key, processing.retryAfterSeconds());
+                writeProcessing(response, processing.retryAfterSeconds());
             }
             case ClaimResult.Rejected rejected -> {
                 writeRejection(response, rejected.reason(),
@@ -123,19 +124,28 @@ public class IdempotencyFilter extends OncePerRequestFilter {
         log.info("[幂等] key={} 获得执行权（{}），开始执行业务", key, isRetry ? "失败重试" : "首次提交");
         CachedBodyHttpServletResponse cachedResponse = new CachedBodyHttpServletResponse(response);
         try {
-            filterChain.doFilter(cachedRequest, cachedResponse);
-        } catch (IOException | ServletException | RuntimeException e) {
-            markFailed(key, e);
-            throw e;
-        }
-        cachedResponse.flush();
+            try {
+                filterChain.doFilter(cachedRequest, cachedResponse);
+            } catch (IOException | ServletException | RuntimeException e) {
+                markFailed(key, e);
+                throw e;
+            }
+            cachedResponse.flush();
 
-        int httpStatus = cachedResponse.getStatus();
-        if (httpStatus >= 200 && httpStatus < 300) {
-            persistSuccess(key, httpStatus, cachedResponse);
-        } else {
-            log.warn("[幂等] key={} 业务返回非 2xx（status={}），标记 FAILED，允许同内容重试", key, httpStatus);
-            store.fail(key);
+            int httpStatus = cachedResponse.getStatus();
+            if (httpStatus >= 200 && httpStatus < 300) {
+                persistSuccess(key, httpStatus, cachedResponse);
+            } else {
+                log.warn("[幂等] key={} 业务返回非 2xx（status={}），标记 FAILED，允许同内容重试", key, httpStatus);
+                store.fail(key);
+            }
+        } finally {
+            // 业务这一次真实执行已经结束（成功/失败/固化兜底均算），释放“在途执行护栏”。
+            // 护栏释放后语义：
+            //  - 成功：结果已固化，后续重放；
+            //  - 失败：FAILED 窗口内可同内容重试；
+            //  - 固化也失败：记录停在 PROCESSING 直到处理中窗口自然到期，到期后才能重新处理。
+            store.releaseInFlight(key);
         }
     }
 
@@ -150,8 +160,8 @@ public class IdempotencyFilter extends OncePerRequestFilter {
             // 记录停留在 PROCESSING：TTL 内同键重试会得到 409 PROCESSING，避免重复副作用；
             // 超过 TTL 后键才重新可用。运维必须通过此日志/监控发现并介入。
             log.error("[幂等][兜底] key={} 业务已成功但结果固化失败！响应已正常返回客户端，"
-                    + "该键在 TTL({}) 内重试将返回 409，请勿盲目重试。原因: {}",
-                    key, properties.getTtl(), e.getMessage());
+                    + "该键在处理中窗口({}) 内重试将返回 409，请勿盲目重试，窗口到期后键重新可用。原因: {}",
+                    key, retentionPolicy.getProcessingTtl(), e.getMessage());
         }
     }
 
@@ -180,25 +190,27 @@ public class IdempotencyFilter extends OncePerRequestFilter {
         response.getOutputStream().flush();
     }
 
-    private void writeProcessing(HttpServletResponse response) throws IOException {
+    private void writeProcessing(HttpServletResponse response, int retryAfterSeconds) throws IOException {
         response.setStatus(HttpStatus.CONFLICT.value());
-        response.setHeader("Retry-After", "2");
+        response.setHeader("Retry-After", Integer.toString(retryAfterSeconds));
         writeJson(response, HttpStatus.CONFLICT.value(),
                 "IDEMPOTENCY_PROCESSING", null,
-                "相同幂等键的首次请求仍在处理中，请稍后使用相同的 Idempotency-Key 重试");
+                "相同幂等键的首次请求仍在处理中，请约 " + retryAfterSeconds
+                        + " 秒后使用相同的 Idempotency-Key 重试");
     }
 
     private void writeRejection(HttpServletResponse response, RejectionReason reason, String message)
             throws IOException {
         int status = switch (reason) {
             case MISSING_KEY, INVALID_KEY_FORMAT, REQUEST_MISMATCH -> HttpStatus.BAD_REQUEST.value();
-            case STORAGE_UNAVAILABLE -> HttpStatus.SERVICE_UNAVAILABLE.value();
+            case STORAGE_UNAVAILABLE, CAPACITY_FULL -> HttpStatus.SERVICE_UNAVAILABLE.value();
         };
         String code = switch (reason) {
             case MISSING_KEY -> "IDEMPOTENCY_MISSING_KEY";
             case INVALID_KEY_FORMAT -> "IDEMPOTENCY_INVALID_KEY_FORMAT";
             case REQUEST_MISMATCH -> "IDEMPOTENCY_REQUEST_MISMATCH";
             case STORAGE_UNAVAILABLE -> "IDEMPOTENCY_STORAGE_UNAVAILABLE";
+            case CAPACITY_FULL -> "IDEMPOTENCY_CAPACITY_FULL";
         };
         log.info("[幂等] 拒绝请求 reason={} status={}", reason, status);
         writeJson(response, status, code, reason, message);

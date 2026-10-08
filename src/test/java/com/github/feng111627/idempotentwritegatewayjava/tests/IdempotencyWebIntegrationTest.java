@@ -36,7 +36,10 @@ import com.github.feng111627.idempotentwritegatewayjava.order.OrderService;
  * 端到端集成测试：经过真实的 Filter → Controller → Service 链路，
  * 覆盖需求要求的四类场景：重复提交、并发抢占、过期重放、存储异常。
  */
-@SpringBootTest(properties = "idempotency.ttl=1s")
+@SpringBootTest(properties = {
+        "idempotency.processing-ttl=1s",
+        "idempotency.succeeded-ttl=1s",
+        "idempotency.failed-ttl=1s"})
 @AutoConfigureMockMvc
 class IdempotencyWebIntegrationTest {
 
@@ -46,6 +49,11 @@ class IdempotencyWebIntegrationTest {
     static class TestStore extends InMemoryIdempotencyStore {
         private final AtomicLong clock = new AtomicLong(System.currentTimeMillis());
         private volatile boolean failOnComplete;
+
+        TestStore(com.github.feng111627.idempotentwritegatewayjava.idempotency
+                          .RetentionPolicy policy) {
+            super(policy);
+        }
 
         @Override
         protected long nowMillis() {
@@ -74,8 +82,9 @@ class IdempotencyWebIntegrationTest {
     static class TestStoreConfig {
         @Bean
         @Primary
-        TestStore testStore() {
-            return new TestStore();
+        TestStore testStore(com.github.feng111627.idempotentwritegatewayjava.idempotency
+                                    .RetentionPolicy policy) {
+            return new TestStore(policy);
         }
     }
 

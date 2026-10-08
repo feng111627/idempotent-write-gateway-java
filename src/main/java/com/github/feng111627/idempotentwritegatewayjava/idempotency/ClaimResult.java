@@ -24,11 +24,15 @@ public sealed interface ClaimResult {
     record Replaying(IdempotencyRecord record) implements ClaimResult {
     }
 
-    /** 同键请求仍在处理中。 */
-    record Processing() implements ClaimResult {
+    /**
+     * 同键请求仍在处理中。
+     *
+     * @param retryAfterSeconds 建议客户端多少秒后再来重试（秒，向上取整，最小 1）
+     */
+    record Processing(int retryAfterSeconds) implements ClaimResult {
     }
 
-    /** 因明确原因被拒绝。 */
+    /** 因明确原因被拒绝（内容冲突，或容量已满且无法腾出空间）。 */
     record Rejected(RejectionReason reason) implements ClaimResult {
     }
 }

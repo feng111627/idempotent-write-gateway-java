@@ -13,11 +13,24 @@ public interface IdempotencyStore {
      *
      * @param key           幂等键
      * @param requestHash   请求内容指纹
-     * @param ttl           记录存活时间（从抢占成功时刻起算）
+     * @param policy        分状态保留策略与容量上限
      * @return 抢占结果
      * @throws IdempotencyStorageException 存储不可用时抛出
      */
-    ClaimResult claim(String key, String requestHash, Duration ttl);
+    ClaimResult claim(String key, String requestHash, RetentionPolicy policy);
+
+    /**
+     * 查询某幂等键当前的对外状态（不会触发淘汰，也不改变记录）。
+     */
+    KeyStateView query(String key);
+
+    /**
+     * 业务执行结束（成功固化 / 失败标记 / 兜底放弃）后，释放“处理中执行护栏”。
+     *
+     * <p>护栏的作用见 {@code InMemoryIdempotencyStore}：即使 PROCESSING 记录的
+     * 保留窗口已到，只要首请的业务还在真实执行，同键的新请求也不能真正再执行业务。
+     */
+    void releaseInFlight(String key);
 
     /**
      * 业务执行成功后固化响应（状态置为 SUCCEEDED）。
